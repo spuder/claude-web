@@ -1,4 +1,10 @@
-# Claude Web (proof of concept)
+# Claude Web
+
+Herder, Omnigent and Orca IDE are all great meta-harnesses, but they have the workflow
+backwards: you start from a free-form agent or thread name. Real work is already tracked as
+issues and PRs on GitHub, GitLab and Forgejo, so those should be the first-class citizen.
+In Claude Web you start from the issue or PR, and the agent, its branch and its worktree
+hang off it.
 
 A local website that wraps the `claude` CLI: pick a project, get a real Claude Code
 session in an in-browser terminal (xterm.js ↔ WebSocket ↔ node-pty).
@@ -15,6 +21,11 @@ Env vars:
 - `PROJECTS_ROOT`: directory whose subfolders appear as projects (default `~/Work`)
 - `CLAUDE_BIN`: path to the claude binary (default `claude` on PATH)
 - `SETTINGS_FILE`: where integrations are stored (default `~/.config/claude-web/settings.json`)
+- `STATE_DIR`: where running agents are tracked (default `~/.local/state/claude-web`)
+
+Requires `tmux`. Each agent runs in its own tmux server, so agents keep running when you
+close or reload the tab, and when the Claude Web server restarts: reopen the page and
+they're still in the sidebar. Closing an agent with × ends it.
 
 ## Integrations (GitHub, GitLab, Forgejo/Gitea)
 

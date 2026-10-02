@@ -1,28 +1,28 @@
-// Proof-of-concept web wrapper around the Claude CLI.
-// Serves a project sidebar + in-browser terminals (xterm.js) bridged to real
-// PTYs running `claude`, with optional GitHub/GitLab/Forgejo integrations.
+// Claude Web hub: serves the UI, owns forge integrations and tokens, and drives
+// one or more nodes (machines that host projects and run agents). Today the only
+// node is this machine; see node/local-node.js for the node interface.
 
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
 const { WebSocketServer } = require('ws');
-const pty = require('node-pty');
 const forges = require('./forges');
-
-const run = promisify(execFile);
+const { LocalNode } = require('./node/local-node');
 
 const PORT = Number(process.env.PORT || 3456);
-const HOST = '127.0.0.1'; // local only: this spawns a shell-capable agent
+const HOST = '127.0.0.1'; // local only: this spawns shell-capable agents
 const PROJECTS_ROOT = path.resolve(
   (process.env.PROJECTS_ROOT || path.join(os.homedir(), 'Work')).replace(/^~/, os.homedir())
 );
-const WORKTREES_ROOT = path.join(PROJECTS_ROOT, '.worktrees'); // hidden, so not listed as a project
-const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
-const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+const STATE_DIR = path.resolve(
+  process.env.STATE_DIR || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'claude-web')
+);
 const REPO_RE = /^[\w.-]+(\/[\w.-]+)+$/;
+
+const nodes = new Map();
+const local = new LocalNode({ root: PROJECTS_ROOT, claudeBin: process.env.CLAUDE_BIN || 'claude', stateDir: STATE_DIR });
+nodes.set(local.id, local);
 
 const STATIC = {
   '/': ['public/index.html', 'text/html'],
@@ -33,20 +33,6 @@ const STATIC = {
   '/addon-fit.js': ['node_modules/@xterm/addon-fit/lib/addon-fit.js', 'text/javascript'],
 };
 
-// Drop session markers inherited when this server is itself started from a
-// Claude Code session, so each spawned claude is a fresh top-level session.
-const INHERITED_SESSION_VARS = [
-  'CLAUDECODE', 'CLAUDE_PID', 'CLAUDE_EFFORT', 'CLAUDE_CODE_CHILD_SESSION',
-  'CLAUDE_CODE_SESSION_ID', 'CLAUDE_CODE_SESSION_ATTENDED', 'CLAUDE_CODE_ENTRYPOINT',
-  'CLAUDE_CODE_EXECPATH', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_CODE_MESSAGING_TOKEN',
-];
-
-function childEnv(extra = {}) {
-  const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
-  for (const k of INHERITED_SESSION_VARS) delete env[k];
-  return { ...env, ...extra };
-}
-
 class HttpError extends Error {
   constructor(status, message) {
     super(message);
@@ -54,80 +40,43 @@ class HttpError extends Error {
   }
 }
 
+function getNode(id) {
+  const node = nodes.get(id || 'local');
+  if (!node) throw new HttpError(404, 'Unknown machine.');
+  return node;
+}
+
+async function getProject(node, p) {
+  const project = await node.getProject(p);
+  if (!project) throw new HttpError(400, 'Invalid project directory.');
+  return project;
+}
+
+const authEnv = (forge) => forges.gitAuthEnv([forge?.origin?.integration, forge?.upstream?.integration]);
+const noMatch = () => new HttpError(404, "This project's remotes don't match a connected integration.");
+
 // ---------- projects ----------
 
-function listProjects() {
-  return fs
-    .readdirSync(PROJECTS_ROOT, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
-    .map((d) => {
-      const full = path.join(PROJECTS_ROOT, d.name);
-      const forge = forges.findForge(full);
-      return {
-        name: d.name,
-        path: full,
-        git: fs.existsSync(path.join(full, '.git')),
-        claudeMd: fs.existsSync(path.join(full, 'CLAUDE.md')),
-        forge: forge && { type: forge.integration.type, repo: forge.repo, upstream: forge.upstream?.repo || null },
-      };
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
+async function listProjects(node) {
+  return (await node.listProjects()).map(({ remotes, ...p }) => {
+    const forge = forges.forgeFromRemotes(remotes);
+    return {
+      ...p,
+      node: node.id,
+      forge: forge && { type: forge.integration.type, repo: forge.repo, upstream: forge.upstream?.repo || null },
+    };
+  });
 }
 
-function resolveProject(p) {
-  if (!p) return null;
-  const full = path.resolve(p.replace(/^~/, os.homedir()));
-  try {
-    return fs.statSync(full).isDirectory() ? full : null;
-  } catch {
-    return null;
-  }
-}
-
-function newProjectDir(name) {
-  name = String(name || '').trim();
-  if (!NAME_RE.test(name)) {
-    throw new HttpError(400, 'Use letters, numbers, ".", "_" or "-" (must start with a letter or number).');
-  }
-  const full = path.join(PROJECTS_ROOT, name);
-  if (fs.existsSync(full)) throw new HttpError(409, `"${name}" already exists.`);
-  return full;
-}
-
-async function createProject({ name, git }) {
-  const full = newProjectDir(name);
-  fs.mkdirSync(full);
-  if (git) await run('git', ['init', '-q'], { cwd: full });
-  console.log(`[create] ${full}${git ? ' (git)' : ''}`);
-  return { name: path.basename(full), path: full };
-}
-
-const forgeAuthEnv = (forge) => ({ ...process.env, ...forges.gitAuthEnv([forge?.origin?.integration, forge?.upstream?.integration]) });
-
-async function addUpstream(dir, i, parent) {
-  const env = { ...process.env, ...forges.gitAuthEnv(i) };
-  await run('git', ['remote', 'add', 'upstream', forges.cloneUrl(i, parent)], { cwd: dir });
-  await run('git', ['fetch', '--quiet', 'upstream'], { cwd: dir, env, timeout: 10 * 60 * 1000 });
-  console.log(`[upstream] ${dir} <- ${parent}`);
-}
-
-async function cloneProject({ integration: id, repo, name, upstream }) {
+async function cloneProject({ node: nodeId, integration: id, repo, name, upstream }) {
+  const node = getNode(nodeId);
   const i = forges.getIntegration(id);
   if (!i) throw new HttpError(404, 'Integration not found.');
   repo = String(repo || '').trim().replace(/^\/+|\/+$|\.git$/g, '');
   if (!REPO_RE.test(repo)) throw new HttpError(400, 'Repo must look like owner/name.');
-  const full = newProjectDir(name || repo.split('/').pop());
 
-  console.log(`[clone] ${repo} -> ${full}`);
-  try {
-    await run('git', ['clone', '--', forges.cloneUrl(i, repo), full], {
-      env: { ...process.env, ...forges.gitAuthEnv(i) },
-      timeout: 10 * 60 * 1000,
-    });
-  } catch (err) {
-    fs.rmSync(full, { recursive: true, force: true });
-    throw new HttpError(502, `git clone failed: ${(err.stderr || err.message).trim().slice(0, 300)}`);
-  }
+  const env = forges.gitAuthEnv(i);
+  const result = await node.clone({ url: forges.cloneUrl(i, repo), name: name || repo.split('/').pop(), env });
 
   // For forks, wire up the parent as `upstream` so issues/PRs come from there.
   let upstreamRepo = null;
@@ -136,74 +85,45 @@ async function cloneProject({ integration: id, repo, name, upstream }) {
     try {
       const { parent } = await forges.getRepoInfo(i, repo);
       if (parent) {
-        await addUpstream(full, i, parent);
+        await node.addRemote({ path: result.path, name: 'upstream', url: forges.cloneUrl(i, parent), fetch: true, env });
         upstreamRepo = parent;
       }
     } catch (err) {
-      warning = `Cloned, but adding the upstream remote failed: ${(err.stderr || err.message).trim().slice(0, 200)}`;
+      warning = `Cloned, but adding the upstream remote failed: ${err.message.slice(0, 200)}`;
     }
   }
-  return { name: path.basename(full), path: full, upstream: upstreamRepo, warning };
+  return { ...result, upstream: upstreamRepo, warning };
 }
 
 // Add the fork parent of an existing project's origin as `upstream`.
-async function addUpstreamToProject({ project }) {
-  const dir = resolveProject(project);
-  if (!dir) throw new HttpError(400, 'Invalid project directory.');
-  const forge = forges.findForge(dir, 'origin');
-  if (!forge) throw new HttpError(404, "This project's origin remote doesn't match a connected integration.");
-  if (forge.upstream || fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8').includes('[remote "upstream"]')) {
-    throw new HttpError(409, 'This project already has an upstream remote.');
-  }
+async function addUpstreamToProject({ node: nodeId, project }) {
+  const node = getNode(nodeId);
+  const { path: dir, remotes } = await getProject(node, project);
+  if (remotes.upstream) throw new HttpError(409, 'This project already has an upstream remote.');
+  const forge = forges.forgeFromRemotes(remotes, 'origin');
+  if (!forge) throw noMatch();
   const { parent } = await forges.getRepoInfo(forge.integration, forge.repo);
   if (!parent) throw new HttpError(400, `${forge.repo} isn't a fork.`);
-  try {
-    await addUpstream(dir, forge.integration, parent);
-  } catch (err) {
-    throw new HttpError(502, `Adding upstream failed: ${(err.stderr || err.message).trim().slice(0, 300)}`);
-  }
+  await node.addRemote({ path: dir, name: 'upstream', url: forges.cloneUrl(forge.integration, parent), fetch: true, env: authEnv(forge) });
   return { upstream: parent };
 }
 
 // ---------- issue / PR agents ----------
 
-// Each issue/PR agent gets its own worktree so parallel agents don't fight
-// over one checkout. Re-opening the same item reuses its worktree.
-async function prepareWorktree(project, forge, kind, number) {
+async function prepareTaskWorktree(node, project, forge, kind, number) {
   // Items from origin on a fork with upstream get a prefix so they can't collide with upstream's numbers.
   const slug = `${forge.remote === 'origin' && forge.upstream ? 'origin-' : ''}${kind}-${number}`;
-  const wt = path.join(WORKTREES_ROOT, path.basename(project), slug);
-  if (fs.existsSync(wt)) return { dir: wt, branch: slug };
-
-  fs.mkdirSync(path.dirname(wt), { recursive: true });
-  const env = forgeAuthEnv(forge);
-  const git = (args) => run('git', args, { cwd: project, env, timeout: 10 * 60 * 1000 });
-
+  let prFetch = null;
+  let base = null;
   if (kind === 'pr') {
-    // PR refs live on the repo the PR targets. Force-update the local branch to its current head.
-    await git(['fetch', forge.remote, `+${forges.prRef(forge.integration, number)}:refs/heads/${slug}`]);
-    await git(['worktree', 'add', wt, slug]);
-    return { dir: wt, branch: slug };
-  }
-
-  const branchExists = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${slug}`]).then(
-    () => true,
-    () => false
-  );
-  if (branchExists) {
-    await git(['worktree', 'add', wt, slug]);
-    return { dir: wt, branch: slug };
-  }
-
-  // On a fork, start fixes from upstream's latest default branch, not whatever is checked out locally.
-  let base = 'HEAD';
-  if (forge.remote === 'upstream') {
+    // PR refs live on the repo the PR targets.
+    prFetch = { remote: forge.remote, ref: forges.prRef(forge.integration, number) };
+  } else if (forge.remote === 'upstream') {
+    // On a fork, start fixes from upstream's latest default branch, not whatever is checked out locally.
     const { defaultBranch } = await forges.getRepoInfo(forge.integration, forge.repo);
-    await git(['fetch', '--quiet', 'upstream', defaultBranch]);
-    base = `upstream/${defaultBranch}`;
+    base = { remote: 'upstream', branch: defaultBranch };
   }
-  await git(['worktree', 'add', '--no-track', '-b', slug, wt, base]);
-  return { dir: wt, branch: slug, base };
+  return node.prepareWorktree({ project, slug, prFetch, base, env: authEnv(forge) });
 }
 
 async function taskPrompt(forge, kind, number, { branch, base }) {
@@ -235,6 +155,52 @@ async function taskPrompt(forge, kind, number, { branch, base }) {
         `If I ask you to push, push to origin and open the ${kind === 'pr' ? noun : 'pull request'} against upstream.`
       : '';
   return intro + ask + remotes;
+}
+
+// ---------- sessions ----------
+
+async function listSessions() {
+  const all = [];
+  for (const node of nodes.values()) {
+    for (const s of await node.listSessions()) all.push({ ...s, node: node.id });
+  }
+  return all;
+}
+
+// meta (label, project, task) is stored with the session so any browser can rebuild the sidebar.
+async function startSession({ node: nodeId, project: projectPath, label, task, continue: cont, cols, rows }) {
+  const node = getNode(nodeId);
+  const project = await getProject(node, projectPath);
+  const remote = task?.remote;
+  if (remote && !['origin', 'upstream'].includes(remote)) throw new HttpError(400, 'Invalid remote.');
+  const forge = forges.forgeFromRemotes(project.remotes, remote);
+
+  let cwd = project.path;
+  const args = [];
+  let cleanTask = null;
+  if (task) {
+    const kind = task.kind;
+    const number = Number(task.number);
+    if (!['issue', 'pr'].includes(kind) || !Number.isInteger(number) || number < 1) throw new HttpError(400, 'Invalid issue/PR.');
+    if (!forge) throw noMatch();
+    const wt = await prepareTaskWorktree(node, project.path, forge, kind, number);
+    cwd = wt.dir;
+    if (task.resume) args.push('--continue');
+    else args.push(await taskPrompt(forge, kind, number, wt));
+    cleanTask = { kind, number, remote: forge.remote };
+  } else if (cont) {
+    args.push('--continue');
+  }
+
+  const info = await node.startSession({
+    cwd,
+    args,
+    env: forge ? authEnv(forge) : {},
+    cols: Math.max(20, Math.min(500, Number(cols) || 120)),
+    rows: Math.max(5, Math.min(200, Number(rows) || 32)),
+    meta: { project: project.path, label: String(label || 'Agent').slice(0, 200), task: cleanTask },
+  });
+  return { ...info, node: node.id };
 }
 
 // ---------- HTTP ----------
@@ -269,8 +235,11 @@ function sendJson(res, status, body) {
 }
 
 const routes = {
-  'GET /api/projects': () => ({ root: PROJECTS_ROOT, projects: listProjects() }),
-  'POST /api/projects': (q, body) => createProject(body),
+  'GET /api/projects': async (q) => {
+    const node = getNode(q.get('node'));
+    return { root: node.root, node: node.id, projects: await listProjects(node) };
+  },
+  'POST /api/projects': (q, body) => getNode(body.node).createProject(body),
   'POST /api/clone': (q, body) => cloneProject(body),
   'POST /api/upstream': (q, body) => addUpstreamToProject(body),
   'GET /api/repo-info': (q) => {
@@ -279,6 +248,13 @@ const routes = {
     const repo = (q.get('repo') || '').trim();
     if (!REPO_RE.test(repo)) throw new HttpError(400, 'Repo must look like owner/name.');
     return forges.getRepoInfo(i, repo);
+  },
+
+  'GET /api/sessions': () => listSessions(),
+  'POST /api/sessions': (q, body) => startSession(body),
+  'DELETE /api/sessions': async (q) => {
+    await getNode(q.get('node')).killSession(q.get('id'));
+    return { ok: true };
   },
 
   'GET /api/settings': () => ({
@@ -298,9 +274,9 @@ const routes = {
     return search ? forges.searchRepos(i, search.slice(0, 200)) : forges.listRepos(i);
   },
   'GET /api/forge/items': async (q) => {
-    const dir = resolveProject(q.get('project'));
-    const forge = dir && forges.findForge(dir, q.get('remote'));
-    if (!forge) throw new HttpError(404, "This project's remotes don't match a connected integration.");
+    const project = await getProject(getNode(q.get('node')), q.get('project'));
+    const forge = forges.forgeFromRemotes(project.remotes, q.get('remote'));
+    if (!forge) throw noMatch();
 
     // A fork cloned without upstream: point the user at the parent, where the issues usually are.
     let suggestUpstream = null;
@@ -378,8 +354,10 @@ const server = http.createServer(async (req, res) => {
   });
 });
 
-// ---------- PTY over WebSocket ----------
+// ---------- terminal streams ----------
 
+// /pty?session=<id>&node=<id> attaches a viewer to a running session. Closing the
+// socket only detaches; the agent keeps running until it's explicitly closed.
 const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
@@ -392,65 +370,19 @@ server.on('upgrade', (req, socket, head) => {
   wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, url));
 });
 
-wss.on('connection', async (ws, url) => {
-  const say = (text) => ws.send(JSON.stringify({ type: 'output', data: text }));
-  const fail = (text) => {
-    say(`\r\n\x1b[31m${text}\x1b[0m\r\n`);
-    ws.close();
-  };
-  const q = url.searchParams;
-
-  const project = resolveProject(q.get('project'));
-  if (!project) return fail('Invalid project directory.');
-
-  let cwd = project;
-  const args = [];
-  const remote = q.get('remote');
-  if (remote && !['origin', 'upstream'].includes(remote)) return fail('Invalid remote.');
-  const forge = forges.findForge(project, remote);
-  const extraEnv = forge ? forges.gitAuthEnv([forge.origin?.integration, forge.upstream?.integration]) : {};
-
-  const kind = q.get('kind');
-  const number = Number(q.get('number'));
-  if (kind) {
-    if (!['issue', 'pr'].includes(kind) || !Number.isInteger(number) || number < 1) return fail('Invalid issue/PR.');
-    if (!forge) return fail("This project's remotes don't match a connected integration.");
-    try {
-      say(`\x1b[2mPreparing worktree for ${kind} #${number}…\x1b[0m\r\n`);
-      const wt = await prepareWorktree(project, forge, kind, number);
-      cwd = wt.dir;
-      if (q.get('resume') === '1') args.push('--continue');
-      else args.push(await taskPrompt(forge, kind, number, wt));
-    } catch (err) {
-      return fail(`Couldn't set up ${kind} #${number}: ${(err.stderr || err.message).trim()}`);
-    }
-    if (ws.readyState !== ws.OPEN) return; // tab closed while we were working
-  } else if (q.get('continue') === '1') {
-    args.push('--continue');
-  }
-
-  const cols = Number(q.get('cols')) || 120;
-  const rows = Number(q.get('rows')) || 32;
-
-  let term;
+wss.on('connection', (ws, url) => {
+  const send = (msg) => ws.readyState === ws.OPEN && ws.send(JSON.stringify(msg));
+  let controls;
   try {
-    term = pty.spawn(CLAUDE_BIN, args, { name: 'xterm-256color', cols, rows, cwd, env: childEnv(extraEnv) });
+    const node = getNode(url.searchParams.get('node'));
+    controls = node.attachSession(url.searchParams.get('session'), (event) => {
+      send(event);
+      if (event.type === 'closed') ws.close();
+    });
   } catch (err) {
-    return fail(`Failed to start claude: ${err.message}`);
+    send({ type: 'error', message: err.message });
+    return ws.close();
   }
-  console.log(`[pty ${term.pid}] claude${kind ? ` (${kind} #${number})` : ''} in ${cwd}`);
-  ws.send(JSON.stringify({ type: 'started', cwd }));
-
-  term.onData((data) => {
-    if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'output', data }));
-  });
-  term.onExit(({ exitCode }) => {
-    console.log(`[pty ${term.pid}] exited ${exitCode}`);
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'exit', code: exitCode }));
-      ws.close();
-    }
-  });
 
   ws.on('message', (raw) => {
     let msg;
@@ -459,18 +391,18 @@ wss.on('connection', async (ws, url) => {
     } catch {
       return;
     }
-    if (msg.type === 'input') term.write(msg.data);
-    else if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) term.resize(msg.cols, msg.rows);
+    if (msg.type === 'input' && typeof msg.data === 'string') controls.write(msg.data);
+    else if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) controls.resize(msg.cols, msg.rows);
   });
-  ws.on('close', () => {
-    try {
-      term.kill();
-    } catch {}
-  });
+  ws.on('close', () => controls.detach());
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Claude Web running at http://${HOST}:${PORT}`);
-  console.log(`Projects root: ${PROJECTS_ROOT}`);
-  console.log(`Settings file: ${forges.SETTINGS_FILE}`);
-});
+(async () => {
+  for (const node of nodes.values()) await node.init();
+  server.listen(PORT, HOST, () => {
+    console.log(`Claude Web running at http://${HOST}:${PORT}`);
+    console.log(`Projects root: ${PROJECTS_ROOT}`);
+    console.log(`Settings file: ${forges.SETTINGS_FILE}`);
+    console.log(`State dir: ${STATE_DIR}`);
+  });
+})();

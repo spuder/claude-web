@@ -296,16 +296,6 @@ function gitAuthEnv(integrations, baseEnv = process.env) {
   return env;
 }
 
-function readRemoteUrl(dir, name) {
-  try {
-    const cfg = fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8');
-    const m = cfg.match(new RegExp(`\\[remote "${name}"\\][^[]*?url\\s*=\\s*(\\S+)`));
-    return m ? m[1] : null;
-  } catch {
-    return null;
-  }
-}
-
 function parseRemote(url) {
   const scp = url.match(/^[\w.-]+@([^:/]+):(.+)$/); // git@host:owner/repo.git
   let host, p;
@@ -322,9 +312,8 @@ function parseRemote(url) {
   return { host, path: p.replace(/^\/+/, '').replace(/\/+$/, '').replace(/\.git$/, '') };
 }
 
-// Connected integration + "owner/repo" for one of a project's remotes, or null.
-function matchRemote(dir, name) {
-  const url = readRemoteUrl(dir, name);
+// Connected integration + "owner/repo" for a remote URL, or null.
+function matchRemoteUrl(url, name) {
   const remote = url && parseRemote(url);
   if (!remote) return null;
   for (const i of loadSettings().integrations) {
@@ -337,12 +326,13 @@ function matchRemote(dir, name) {
   return null;
 }
 
-// Where a project's issues/PRs live. For forks with an `upstream` remote that's
-// upstream (unless `prefer` is 'origin'); otherwise origin. Both matches are
-// returned so callers can set up auth and describe the remotes.
-function findForge(dir, prefer) {
-  const origin = matchRemote(dir, 'origin');
-  const upstream = matchRemote(dir, 'upstream');
+// Where a project's issues/PRs live, given its remote URLs ({ origin, upstream }).
+// For forks with an `upstream` remote that's upstream (unless `prefer` is
+// 'origin'); otherwise origin. Both matches are returned so callers can set up
+// auth and describe the remotes.
+function forgeFromRemotes(remotes = {}, prefer) {
+  const origin = matchRemoteUrl(remotes.origin, 'origin');
+  const upstream = matchRemoteUrl(remotes.upstream, 'upstream');
   const chosen = prefer === 'origin' ? origin : upstream || origin;
   if (!chosen) return null;
   return { ...chosen, origin, upstream };
@@ -367,5 +357,5 @@ module.exports = {
   prRef,
   cloneUrl,
   gitAuthEnv,
-  findForge,
+  forgeFromRemotes,
 };

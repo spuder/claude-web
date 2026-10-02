@@ -2,10 +2,11 @@ const $ = (id) => document.getElementById(id);
 
 let projects = [];
 // Live agents (one claude process each), kept running while you switch between them.
-const sessions = new Map(); // id -> { id, path, label, ws, term, fit, el, status, running }
+// Agents run on the server (inside tmux) and outlive this tab; these are our views of them.
+const sessions = new Map(); // id -> { id, node, path, label, task, ws, term, fit, el, status, running }
 const agentCounters = new Map(); // path -> last agent number used
 let activeId = null;
-let nextId = 1;
+let pendingId = 0;
 
 const sessionsFor = (path) => [...sessions.values()].filter((s) => s.path === path);
 const activeSession = () => sessions.get(activeId);
@@ -110,88 +111,154 @@ function showSession(id) {
   renderProjects();
 }
 
-// task: optional { kind: 'issue' | 'pr', number, resume } to start the agent on a forge item.
-function newAgent(projectPath, label, task) {
-  if (!label) {
-    const n = (agentCounters.get(projectPath) || 0) + 1;
-    agentCounters.set(projectPath, n);
-    label = `Agent ${n}`;
-  }
-  const id = nextId++;
-
+function makeTerminal() {
   const container = el('div', 'term');
   $('terminals').append(container);
-
   const term = new Terminal({
     cursorBlink: true,
     fontFamily: 'ui-monospace, "JetBrains Mono", Menlo, monospace',
     fontSize: 14,
+    scrollback: 10000,
     theme: { background: '#1a1915', foreground: '#ece9e1', cursor: '#d97757' },
   });
   const fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(container);
   fit.fit();
+  return { term, fit, el: container };
+}
 
-  const params = new URLSearchParams({
-    project: projectPath,
-    cols: term.cols,
-    rows: term.rows,
-    continue: $('opt-continue').checked ? '1' : '0',
-  });
-  if (task) {
-    params.set('kind', task.kind);
-    if (task.remote) params.set('remote', task.remote);
-    params.set('number', task.number);
-    if (task.resume) params.set('resume', '1');
-  }
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/pty?${params}`);
-  const send = (msg) => ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(msg));
+function setSessionStatus(s, status, running) {
+  s.status = status;
+  if (running !== undefined) s.running = running;
+  if (activeId === s.id) setStatus(status);
+  renderProjects();
+}
 
-  const s = { id, path: projectPath, label, ws, term, fit, el: container, status: 'Connecting…', running: false };
-  sessions.set(id, s);
-
-  const update = (status, running) => {
-    s.status = status;
-    s.running = running;
-    if (activeId === id) setStatus(status);
-    renderProjects();
+// Add a view for a session the server already runs (new, or restored after a reload).
+function addSessionView(info) {
+  const s = {
+    id: info.id,
+    node: info.node,
+    path: info.meta.project,
+    label: info.meta.label,
+    task: info.meta.task,
+    cwd: info.cwd,
+    running: info.running,
+    status: '',
+    ws: null,
+    retry: 0,
+    ...makeTerminal(),
   };
+  sessions.set(s.id, s);
+  wireTerminal(s);
+  attachSession(s);
+  return s;
+}
 
-  ws.onopen = () => update(`${label} · starting…`, true);
-  ws.onmessage = (e) => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'output') term.write(msg.data);
-    else if (msg.type === 'started') update(`${label} · running claude in ${msg.cwd}`, true);
-    else if (msg.type === 'exit') update(`${label} · claude exited (code ${msg.code}). Click × to close, or press Enter to restart.`, false);
-  };
-  ws.onclose = () => {
-    if (s.running) update(`${label} · disconnected.`, false);
-  };
-
-  term.onData((data) => {
-    // After claude exits, Enter restarts this agent in place (same label). Issue/PR
-    // agents resume their conversation in the same worktree instead of re-prompting.
-    if (!s.running && ws.readyState !== WebSocket.CONNECTING && data === '\r') {
-      closeSession(id, { keepActive: true });
-      return newAgent(projectPath, label, task && { ...task, resume: true });
+function wireTerminal(s) {
+  const send = (msg) => s.ws?.readyState === WebSocket.OPEN && s.ws.send(JSON.stringify(msg));
+  s.term.onData((data) => {
+    // After claude exits, Enter starts it again with the same label. Issue/PR agents
+    // resume their conversation in the same worktree instead of re-prompting.
+    if (!s.running && data === '\r' && !String(s.id).startsWith('pending')) {
+      const { path, label, task, node } = s;
+      closeSession(s.id, { keepActive: true });
+      return newAgent(path, label, task && { ...task, resume: true }, node);
     }
     send({ type: 'input', data });
   });
-  term.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }));
-
-  showSession(id);
+  s.term.onResize(({ cols, rows }) => send({ type: 'resize', cols, rows }));
 }
 
-function closeSession(id, { keepActive = false } = {}) {
+// Stream a session into its terminal, reconnecting if the connection drops.
+function attachSession(s) {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const ws = new WebSocket(`${proto}://${location.host}/pty?${new URLSearchParams({ session: s.id, node: s.node })}`);
+  s.ws = ws;
+  ws.onopen = () => {
+    s.retry = 0;
+    s.term.reset(); // the server replays recent output on every attach
+    ws.send(JSON.stringify({ type: 'resize', cols: s.term.cols, rows: s.term.rows }));
+    if (s.running) setSessionStatus(s, `${s.label} · running claude in ${s.cwd}`);
+  };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'output') s.term.write(msg.data);
+    else if (msg.type === 'exit') setSessionStatus(s, `${s.label} · claude exited (code ${msg.code}). Click × to close, or press Enter to restart.`, false);
+    else if (msg.type === 'closed') closeSession(s.id, { remote: false });
+    else if (msg.type === 'error') {
+      s.gone = true;
+      setSessionStatus(s, `${s.label} · ${msg.message} Click × to close, or press Enter to start a new one.`, false);
+    }
+  };
+  ws.onclose = () => {
+    if (s.ws !== ws || s.gone || !sessions.has(s.id)) return;
+    // Server restarting or network blip: the agent keeps running server-side, so reattach.
+    const delay = Math.min(10000, 500 * 2 ** s.retry++);
+    setSessionStatus(s, `${s.label} · connection lost, reconnecting…`);
+    setTimeout(() => sessions.has(s.id) && s.ws === ws && attachSession(s), delay);
+  };
+}
+
+// task: optional { kind: 'issue' | 'pr', number, remote, resume } to start the agent on a forge item.
+async function newAgent(projectPath, label, task, node = 'local') {
+  if (!label) {
+    const n = (agentCounters.get(projectPath) || 0) + 1;
+    agentCounters.set(projectPath, n);
+    label = `Agent ${n}`;
+  }
+  // Show the agent immediately; preparing a worktree can take a while.
+  const pending = { id: `pending-${++pendingId}`, node, path: projectPath, label, task, running: false, status: '', ...makeTerminal() };
+  sessions.set(pending.id, pending);
+  showSession(pending.id);
+  setSessionStatus(pending, `${label} · starting…`);
+  if (task && !task.resume) pending.term.write(`\x1b[2mPreparing worktree for ${task.kind} #${task.number}…\x1b[0m\r\n`);
+
+  let info;
+  try {
+    info = await api('POST', '/api/sessions', {
+      node,
+      project: projectPath,
+      label,
+      task,
+      continue: $('opt-continue').checked,
+      cols: pending.term.cols,
+      rows: pending.term.rows,
+    });
+  } catch (err) {
+    pending.term.write(`\r\n\x1b[31m${err.message}\x1b[0m\r\n`);
+    setSessionStatus(pending, `${label} · failed to start. Click × to close.`, false);
+    return;
+  }
+  if (!sessions.has(pending.id)) {
+    // Closed while starting: don't leave an orphan running.
+    api('DELETE', `/api/sessions?${new URLSearchParams({ id: info.id, node: info.node })}`, {}).catch(() => {});
+    return;
+  }
+  // Swap the placeholder for the real session, keeping its place and focus.
+  pending.term.dispose();
+  pending.el.remove();
+  sessions.delete(pending.id);
+  const s = addSessionView(info);
+  if (activeId === pending.id) showSession(s.id);
+  else renderProjects();
+}
+
+// remote: also end the agent on the server (false when the server already did).
+function closeSession(id, { keepActive = false, remote = true } = {}) {
   const s = sessions.get(id);
   if (!s) return;
-  s.ws.onclose = null;
-  s.ws.close();
+  sessions.delete(id);
+  if (s.ws) {
+    s.ws.onclose = null;
+    s.ws.close();
+  }
+  if (remote && !String(id).startsWith('pending')) {
+    api('DELETE', `/api/sessions?${new URLSearchParams({ id, node: s.node })}`, {}).catch(() => {});
+  }
   s.term.dispose();
   s.el.remove();
-  sessions.delete(id);
   if (keepActive) return;
   if (activeId === id) {
     // Fall back to another agent in the same project, if any.
@@ -239,9 +306,24 @@ $('custom').onsubmit = (e) => {
   }
 };
 
-loadProjects().then(() => {
-  if (location.hash.length > 1) newAgent(decodeURIComponent(location.hash.slice(1)));
-});
+// Rebuild the sidebar from agents still running on the server, then honor #project.
+(async () => {
+  await loadProjects();
+  try {
+    for (const info of await api('GET', '/api/sessions')) {
+      addSessionView(info);
+      const n = Number((info.meta.label.match(/^Agent (\d+)$/) || [])[1]);
+      if (n > (agentCounters.get(info.meta.project) || 0)) agentCounters.set(info.meta.project, n);
+    }
+  } catch (err) {
+    console.error('Restoring sessions failed', err);
+  }
+  const hashPath = location.hash.length > 1 ? decodeURIComponent(location.hash.slice(1)) : null;
+  const existing = hashPath && sessionsFor(hashPath).pop();
+  if (existing) showSession(existing.id);
+  else if (hashPath) newAgent(hashPath);
+  else renderProjects();
+})();
 
 // ---------- dialogs ----------
 
