@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Web</title>
+  <link rel="stylesheet" href="/xterm.css" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <aside id="sidebar">
+    <div class="brand-row">
+      <div class="brand">✻ Claude Web</div>
+      <button id="btn-settings" class="icon" title="Settings">⚙</button>
+    </div>
+
+    <form id="create" class="create">
+      <input id="create-name" placeholder="New project…" autocomplete="off" />
+      <button type="submit" title="Create &amp; open">+</button>
+    </form>
+    <div class="create-opts">
+      <label class="check"><input type="checkbox" id="create-git" checked /> git init</label>
+      <button id="btn-clone" class="link">⤓ Clone from repo…</button>
+    </div>
+    <p id="create-error" class="error hidden"></p>
+
+    <input id="filter" placeholder="Filter projects…" autocomplete="off" />
+    <ul id="projects"></ul>
+
+    <div class="sidebar-footer">
+      <label class="check"><input type="checkbox" id="opt-continue" /> Continue last conversation</label>
+      <form id="custom" class="custom">
+        <input id="custom-path" placeholder="Open path, e.g. ~/code/app" />
+      </form>
+      <p class="muted root">Root: <code id="root"></code></p>
+    </div>
+  </aside>
+
+  <main id="main">
+    <div id="empty" class="empty">
+      <div>
+        <h1>Pick a project</h1>
+        <p class="muted">Choose one from the sidebar, create a new one, or clone a repo to start a Claude session.</p>
+      </div>
+    </div>
+    <div id="terminals"></div>
+    <div id="status" class="status hidden"></div>
+  </main>
+
+  <!-- Settings -->
+  <dialog id="dlg-settings">
+    <div class="dlg-head"><h2>Settings</h2><button class="icon" data-close>×</button></div>
+    <h3>Integrations</h3>
+    <ul id="integrations" class="rows"></ul>
+    <form id="add-integration" class="stack">
+      <div class="row">
+        <select id="int-type"></select>
+        <input id="int-url" placeholder="Base URL" />
+      </div>
+      <input id="int-token" type="password" placeholder="Personal access token" autocomplete="off" />
+      <p id="int-help" class="muted small"></p>
+      <p id="int-error" class="error hidden"></p>
+      <div class="row end"><button type="submit" class="primary">Connect</button></div>
+    </form>
+    <p class="muted small">Tokens are stored on this machine in <code id="settings-file"></code> (mode 600) and are never sent to the browser.</p>
+  </dialog>
+
+  <!-- Clone -->
+  <dialog id="dlg-clone">
+    <div class="dlg-head"><h2>Clone a repository</h2><button class="icon" data-close>×</button></div>
+    <div id="clone-none" class="muted hidden">No integrations yet. <button class="link" id="clone-open-settings">Add one in Settings</button>.</div>
+    <div id="clone-body" class="stack">
+      <div class="row">
+        <select id="clone-integration"></select>
+        <input id="clone-filter" placeholder="Filter, or type owner/repo" autocomplete="off" />
+      </div>
+      <ul id="clone-repos" class="rows pick"></ul>
+      <div class="row">
+        <input id="clone-repo" placeholder="owner/repo" />
+        <input id="clone-name" placeholder="Folder name" />
+      </div>
+      <p id="clone-error" class="error hidden"></p>
+      <div class="row end"><button id="clone-go" class="primary">Clone &amp; open</button></div>
+    </div>
+  </dialog>
+
+  <!-- Issues / PRs -->
+  <dialog id="dlg-items">
+    <div class="dlg-head"><h2 id="items-title">Issues &amp; PRs</h2><button class="icon" data-close>×</button></div>
+    <p class="muted small">Starting from an item gives the agent its own git worktree and branch, so it can't clash with your other agents.</p>
+    <p id="items-error" class="error hidden"></p>
+    <div id="items-loading" class="muted">Loading…</div>
+    <h3 id="items-prs-h">Pull requests</h3>
+    <ul id="items-prs" class="rows pick"></ul>
+    <h3>Issues</h3>
+    <ul id="items-issues" class="rows pick"></ul>
+  </dialog>
+
+  <script src="/xterm.js"></script>
+  <script src="/addon-fit.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
