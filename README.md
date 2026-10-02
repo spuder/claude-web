@@ -3,6 +3,8 @@
 A local website that wraps the `claude` CLI: pick a project, get a real Claude Code
 session in an in-browser terminal (xterm.js ↔ WebSocket ↔ node-pty).
 
+![Claude Web with the claude-web project open in Claude Code](docs/screenshots/claude-web.png)
+
 ```sh
 npm install
 npm start            # http://127.0.0.1:3456
