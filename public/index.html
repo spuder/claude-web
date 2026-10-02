@@ -72,13 +72,16 @@
     <div id="clone-body" class="stack">
       <div class="row">
         <select id="clone-integration"></select>
-        <input id="clone-filter" placeholder="Filter, or type owner/repo" autocomplete="off" />
+        <input id="clone-filter" placeholder="Search any repo, or paste owner/repo or a URL" autocomplete="off" />
       </div>
       <ul id="clone-repos" class="rows pick"></ul>
       <div class="row">
         <input id="clone-repo" placeholder="owner/repo" />
         <input id="clone-name" placeholder="Folder name" />
       </div>
+      <label id="clone-upstream-row" class="check hidden">
+        <input type="checkbox" id="clone-upstream" checked /> <span id="clone-upstream-text"></span>
+      </label>
       <p id="clone-error" class="error hidden"></p>
       <div class="row end"><button id="clone-go" class="primary">Clone &amp; open</button></div>
     </div>
@@ -88,6 +91,10 @@
   <dialog id="dlg-items">
     <div class="dlg-head"><h2 id="items-title">Issues &amp; PRs</h2><button class="icon" data-close>×</button></div>
     <p class="muted small">Starting from an item gives the agent its own git worktree and branch, so it can't clash with your other agents.</p>
+    <div id="items-remotes" class="segmented hidden"></div>
+    <div id="items-suggest" class="banner hidden"></div>
+    <div id="items-chips" class="chips hidden"></div>
+    <input id="items-filter" placeholder="Type to search titles, #number or author · ↑↓ Enter to start" autocomplete="off" />
     <p id="items-error" class="error hidden"></p>
     <div id="items-loading" class="muted">Loading…</div>
     <h3 id="items-prs-h">Pull requests</h3>

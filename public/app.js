@@ -55,7 +55,8 @@ function renderProjects() {
     if (agents.length) btn.append(el('span', 'tag count', String(agents.length)));
     if (p.git) btn.append(el('span', 'tag', 'git'));
     if (p.claudeMd) btn.append(el('span', 'tag', 'md'));
-    if (p.forge) btn.append(el('span', 'tag', p.forge.type));
+    if (p.forge) btn.append(el('span', 'tag', p.forge.upstream ? `${p.forge.type} fork` : p.forge.type));
+    if (p.forge?.upstream) li.title += `\nupstream: ${p.forge.upstream}`;
     btn.onclick = () => (agents.length ? showSession(agents[agents.length - 1].id) : newAgent(p.path));
     li.append(btn);
     list.append(li);
@@ -140,6 +141,7 @@ function newAgent(projectPath, label, task) {
   });
   if (task) {
     params.set('kind', task.kind);
+    if (task.remote) params.set('remote', task.remote);
     params.set('number', task.number);
     if (task.resume) params.set('resume', '1');
   }
@@ -335,42 +337,138 @@ $('add-integration').onsubmit = async (e) => {
 
 // Clone
 
-let cloneRepos = [];
+let cloneRepos = []; // repos you own or belong to
+let searchResults = null; // forge-wide search results for the current filter, or null
+let searchTimer = null;
+let searchSeq = 0;
+
+const cloneIntegration = () => settings.integrations.find((i) => i.id === $('clone-integration').value);
 
 async function loadCloneRepos() {
   const list = $('clone-repos');
   list.innerHTML = '<li class="empty-row">Loading repositories…</li>';
   showError('clone-error', null);
+  searchResults = null;
   try {
     cloneRepos = await api('GET', `/api/repos?integration=${encodeURIComponent($('clone-integration').value)}`);
   } catch (err) {
     cloneRepos = [];
     showError('clone-error', err);
   }
+  onCloneFilter();
+}
+
+// Turn a pasted clone/web URL on the selected forge into "owner/repo".
+function repoFromUrl(text) {
+  const i = cloneIntegration();
+  if (!i) return null;
+  const base = new URL(i.baseUrl);
+  let host, p;
+  const scp = text.match(/^[\w.-]+@([^:/]+):(.+)$/);
+  if (scp) [, host, p] = scp;
+  else {
+    try {
+      const u = new URL(text);
+      host = u.hostname;
+      p = u.pathname;
+    } catch {
+      return null;
+    }
+  }
+  if (host !== base.hostname) return null;
+  p = p.replace(/^\/+|\/+$/g, '').replace(/\.git$/, '');
+  const prefix = base.pathname.replace(/^\/+|\/+$/g, '');
+  if (prefix && p.startsWith(prefix + '/')) p = p.slice(prefix.length + 1);
+  // Drop web UI suffixes like /-/tree/main (GitLab) or /tree/main, /issues (GitHub, Forgejo).
+  p = p.split('/-/')[0];
+  if (i.type !== 'gitlab') p = p.split('/').slice(0, 2).join('/');
+  return /^[\w.-]+(\/[\w.-]+)+$/.test(p) ? p : null;
+}
+
+function onCloneFilter() {
+  const raw = $('clone-filter').value.trim();
+  clearTimeout(searchTimer);
+
+  const fromUrl = /^(https?:\/\/|[\w.-]+@)/.test(raw) ? repoFromUrl(raw) : null;
+  if (fromUrl) {
+    searchResults = null;
+    return selectCloneRepo(fromUrl);
+  }
+  if (/^[\w.-]+\/[\w.-]+/.test(raw)) selectCloneRepo(raw); // exact owner/repo can be cloned directly
+
+  if (raw.length < 2) {
+    searchResults = null;
+    return renderCloneRepos();
+  }
+  searchResults = 'loading';
   renderCloneRepos();
+  const seq = ++searchSeq;
+  searchTimer = setTimeout(async () => {
+    try {
+      const rs = await api('GET', `/api/repos?integration=${encodeURIComponent($('clone-integration').value)}&q=${encodeURIComponent(raw)}`);
+      if (seq === searchSeq) searchResults = rs;
+    } catch (err) {
+      if (seq === searchSeq) searchResults = { error: err.message };
+    }
+    if (seq === searchSeq) renderCloneRepos();
+  }, 350);
+}
+
+function repoRow(r) {
+  const li = el('li', r.fullName === $('clone-repo').value ? 'selected' : '');
+  li.append(el('span', 'grow', r.fullName));
+  if (r.stars) li.append(el('span', 'num', `★ ${r.stars.toLocaleString()}`));
+  if (r.private) li.append(el('span', 'tag', 'private'));
+  li.title = r.description || '';
+  li.onclick = () => selectCloneRepo(r.fullName);
+  li.ondblclick = () => doClone();
+  return li;
 }
 
 function renderCloneRepos() {
   const q = $('clone-filter').value.trim().toLowerCase();
   const list = $('clone-repos');
   list.innerHTML = '';
-  const shown = cloneRepos.filter((r) => r.fullName.toLowerCase().includes(q));
-  if (!shown.length) list.append(el('li', 'empty-row', q.includes('/') ? 'Not in your list — Clone will try it directly.' : 'No repositories.'));
-  for (const r of shown) {
-    const li = el('li', r.fullName === $('clone-repo').value ? 'selected' : '');
-    li.append(el('span', 'grow', r.fullName));
-    if (r.private) li.append(el('span', 'tag', 'private'));
-    li.title = r.description || '';
-    li.onclick = () => selectCloneRepo(r.fullName);
-    li.ondblclick = () => doClone();
-    list.append(li);
-  }
+
+  const mine = cloneRepos.filter((r) => r.fullName.toLowerCase().includes(q));
+  if (searchResults !== null) list.append(el('li', 'section-row', 'Your repositories'));
+  if (!mine.length) list.append(el('li', 'empty-row', q ? 'No matches.' : 'No repositories.'));
+  for (const r of mine) list.append(repoRow(r));
+
+  if (searchResults === null) return;
+  list.append(el('li', 'section-row', `Search ${cloneIntegration()?.typeLabel || ''}`));
+  if (searchResults === 'loading') return list.append(el('li', 'empty-row', 'Searching…'));
+  if (searchResults.error) return list.append(el('li', 'empty-row', searchResults.error));
+  const own = new Set(cloneRepos.map((r) => r.fullName));
+  const others = searchResults.filter((r) => !own.has(r.fullName));
+  if (!others.length) list.append(el('li', 'empty-row', 'No other results.'));
+  for (const r of others) list.append(repoRow(r));
 }
 
 function selectCloneRepo(fullName) {
+  const changed = $('clone-repo').value !== fullName;
   $('clone-repo').value = fullName;
   $('clone-name').value = fullName.split('/').pop();
   renderCloneRepos();
+  if (changed) checkFork(fullName);
+}
+
+// If the selected repo is a fork, offer to add its parent as `upstream`.
+let forkSeq = 0;
+async function checkFork(fullName) {
+  const seq = ++forkSeq;
+  $('clone-upstream-row').classList.add('hidden');
+  await new Promise((r) => setTimeout(r, 300)); // debounce typing
+  if (seq !== forkSeq) return;
+  try {
+    const info = await api('GET', `/api/repo-info?integration=${encodeURIComponent($('clone-integration').value)}&repo=${encodeURIComponent(fullName)}`);
+    if (seq !== forkSeq || !info.parent) return;
+    $('clone-upstream-text').textContent = `Fork of ${info.parent}: add it as the "upstream" remote (issues and PRs will come from there)`;
+    $('clone-upstream').checked = true;
+    $('clone-upstream-row').classList.remove('hidden');
+  } catch {
+    // Unknown or inaccessible repo; the clone itself will report a clearer error.
+  }
 }
 
 $('btn-clone').onclick = async () => {
@@ -386,6 +484,7 @@ $('btn-clone').onclick = async () => {
   for (const i of settings.integrations) sel.append(new Option(`${i.typeLabel}: ${i.username} @ ${new URL(i.baseUrl).host}`, i.id));
   if (prev && settings.integrations.some((i) => i.id === prev)) sel.value = prev;
   $('clone-filter').value = $('clone-repo').value = $('clone-name').value = '';
+  $('clone-upstream-row').classList.add('hidden');
   loadCloneRepos();
 };
 
@@ -394,11 +493,7 @@ $('clone-open-settings').onclick = () => {
   $('btn-settings').click();
 };
 $('clone-integration').onchange = loadCloneRepos;
-$('clone-filter').oninput = () => {
-  const q = $('clone-filter').value.trim();
-  if (q.includes('/')) selectCloneRepo(q); // allow cloning repos not in the list
-  else renderCloneRepos();
-};
+$('clone-filter').oninput = onCloneFilter;
 $('clone-go').onclick = () => doClone();
 
 async function doClone() {
@@ -413,8 +508,10 @@ async function doClone() {
       integration: $('clone-integration').value,
       repo,
       name: $('clone-name').value.trim(),
+      upstream: !$('clone-upstream-row').classList.contains('hidden') && $('clone-upstream').checked,
     });
     $('dlg-clone').close();
+    if (data.warning) alert(data.warning);
     await loadProjects();
     newAgent(data.path);
   } catch (err) {
@@ -427,41 +524,226 @@ async function doClone() {
 
 // Issues / PRs
 
-async function openItemsDialog(project) {
+const FILTERS = {
+  '': { label: 'All' },
+  assigned: { label: 'Assigned to me', empty: 'assigned to' },
+  created: { label: 'Created by me', empty: 'created by' },
+  mentioned: { label: 'Mentions me', empty: 'mentioning' },
+};
+
+// Last-used filter is a per-browser convenience; storage may be unavailable.
+function savedFilter() {
+  try {
+    const f = localStorage.getItem('claudeWeb.itemsFilter') || '';
+    return f in FILTERS ? f : '';
+  } catch {
+    return '';
+  }
+}
+function saveFilter(f) {
+  try {
+    localStorage.setItem('claudeWeb.itemsFilter', f);
+  } catch {}
+}
+
+async function openItemsDialog(project, remote, filter = savedFilter()) {
   const dlg = $('dlg-items');
   const isGitlab = project.forge.type === 'gitlab';
-  $('items-title').textContent = `${project.forge.repo}: issues & ${isGitlab ? 'merge requests' : 'pull requests'}`;
+  if (isGitlab && filter === 'mentioned') filter = ''; // GitLab can't filter by mentions
+  const prNoun = isGitlab ? 'merge requests' : 'pull requests';
+  $('items-title').textContent = `Issues & ${prNoun}`;
   $('items-prs-h').textContent = isGitlab ? 'Merge requests' : 'Pull requests';
   $('items-prs').innerHTML = $('items-issues').innerHTML = '';
+  itemsCtx = null;
+  clearTimeout(itemsTimer); // drop any search still pending for the previous list
+  itemsSeq++;
+  $('items-remotes').classList.add('hidden');
+  $('items-suggest').classList.add('hidden');
+  $('items-chips').classList.add('hidden');
   $('items-loading').classList.remove('hidden');
   showError('items-error', null);
-  dlg.showModal();
+  if (!dlg.open) dlg.showModal();
 
   let data;
   try {
-    data = await api('GET', `/api/forge/items?project=${encodeURIComponent(project.path)}`);
+    const qs = new URLSearchParams({ project: project.path });
+    if (remote) qs.set('remote', remote);
+    if (filter) qs.set('filter', filter);
+    data = await api('GET', `/api/forge/items?${qs}`);
   } catch (err) {
     showError('items-error', err);
     return;
   } finally {
     $('items-loading').classList.add('hidden');
   }
+  $('items-title').textContent = `${data.repo}: issues & ${prNoun}`;
+  if (data.error) showError('items-error', data.error);
 
-  const fill = (listId, items, prefix) => {
+  // Fork with upstream: let the user switch which repo's items to list.
+  if (data.upstream && data.origin) {
+    const seg = $('items-remotes');
+    seg.innerHTML = '';
+    for (const [r, repo] of [['upstream', data.upstream], ['origin', data.origin]]) {
+      const b = el('button', r === data.remote ? 'on' : '', `${r}: ${repo}`);
+      b.onclick = () => r !== data.remote && openItemsDialog(project, r, filter);
+      seg.append(b);
+    }
+    seg.classList.remove('hidden');
+  }
+
+  // Fork without upstream: offer to add it.
+  if (data.suggestUpstream) {
+    const banner = $('items-suggest');
+    banner.innerHTML = '';
+    banner.append(el('span', 'grow', `${data.repo} is a fork of ${data.suggestUpstream}, where its issues usually live.`));
+    const add = el('button', 'primary', 'Add upstream');
+    add.onclick = async () => {
+      add.disabled = true;
+      add.textContent = 'Adding…';
+      try {
+        await api('POST', '/api/upstream', { project: project.path });
+        await loadProjects();
+        const updated = projects.find((p) => p.path === project.path) || project;
+        openItemsDialog(updated);
+      } catch (err) {
+        showError('items-error', err);
+        add.disabled = false;
+        add.textContent = 'Add upstream';
+      }
+    };
+    banner.append(add);
+    banner.classList.remove('hidden');
+  }
+
+  // Filter chips: "me" is the account of the integration this repo is listed through.
+  const chips = $('items-chips');
+  chips.innerHTML = '';
+  for (const f of ['', ...(data.filters || [])]) {
+    const b = el('button', f === filter ? 'on' : '', FILTERS[f].label);
+    if (f) b.title = `@${data.me}`;
+    b.onclick = async () => {
+      if (f === filter) return;
+      saveFilter(f);
+      const q = $('items-filter').value;
+      await openItemsDialog(project, data.remote, f);
+      if (q && itemsCtx) {
+        $('items-filter').value = q;
+        $('items-filter').dispatchEvent(new Event('input'));
+      }
+    };
+    chips.append(b);
+  }
+  chips.classList.remove('hidden');
+
+  itemsCtx = { project, data, filter, prefix: isGitlab ? 'MR' : 'PR', search: null };
+  $('items-filter').value = '';
+  renderItems();
+  $('items-filter').focus();
+}
+
+// State for the open Issues / PRs dialog.
+let itemsCtx = null;
+let itemsTimer = null;
+let itemsSeq = 0;
+let itemsCursor = 0;
+
+function startItem(it) {
+  const { project, data, prefix } = itemsCtx;
+  $('dlg-items').close();
+  const where = data.upstream && data.remote === 'origin' ? 'origin ' : '';
+  const label = `${where}${it.kind === 'pr' ? prefix : 'Issue'} #${it.number} ${it.title}`;
+  newAgent(project.path, label, { kind: it.kind, number: it.number, remote: data.remote });
+}
+
+function itemMatches(it, q) {
+  if (!q) return true;
+  const num = q.replace(/^#/, '');
+  if (/^\d+$/.test(num)) return String(it.number).startsWith(num);
+  return `${it.title} ${it.author || ''}`.toLowerCase().includes(q.toLowerCase());
+}
+
+// Local matches from the initial list, plus server search results not already shown.
+function visibleItems(kind) {
+  const q = $('items-filter').value.trim();
+  const key = kind === 'pr' ? 'prs' : 'issues';
+  const local = itemsCtx.data[key].filter((it) => itemMatches(it, q));
+  const seen = new Set(local.map((it) => it.number));
+  const remote = Array.isArray(itemsCtx.search?.[key]) ? itemsCtx.search[key].filter((it) => !seen.has(it.number)) : [];
+  return [...local, ...remote];
+}
+
+function renderItems() {
+  const prs = visibleItems('pr');
+  const issues = visibleItems('issue');
+  const all = [...prs, ...issues];
+  itemsCursor = Math.max(0, Math.min(itemsCursor, all.length - 1));
+  const searching = itemsCtx.search === 'loading';
+
+  let idx = 0;
+  const fill = (listId, items) => {
     const list = $(listId);
-    if (!items.length) list.append(el('li', 'empty-row', 'None open.'));
+    list.innerHTML = '';
+    const none = itemsCtx.filter ? `None open ${FILTERS[itemsCtx.filter].empty} @${itemsCtx.data.me}.` : 'None open.';
+    if (!items.length) list.append(el('li', 'empty-row', searching ? 'Searching…' : $('items-filter').value ? 'No matches.' : none));
     for (const it of items) {
-      const li = el('li');
+      const i = idx++;
+      const li = el('li', i === itemsCursor ? 'selected' : '');
       li.append(el('span', 'num', `#${it.number}`), el('span', 'grow', it.title));
+      if (it.state && !['open', 'opened'].includes(it.state)) li.append(el('span', 'tag', it.state));
       if (it.author) li.append(el('span', 'tag', it.author));
       li.title = it.url;
-      li.onclick = () => {
-        dlg.close();
-        newAgent(project.path, `${prefix} #${it.number} ${it.title}`, { kind: it.kind, number: it.number });
+      li.onclick = () => startItem(it);
+      li.onmouseenter = () => {
+        itemsCursor = i;
+        for (const x of document.querySelectorAll('#dlg-items .rows.pick li.selected')) x.classList.remove('selected');
+        li.classList.add('selected');
       };
       list.append(li);
     }
   };
-  fill('items-prs', data.prs, isGitlab ? 'MR' : 'PR');
-  fill('items-issues', data.issues, 'Issue');
+  fill('items-prs', prs);
+  fill('items-issues', issues);
+  if (itemsCtx.search?.error) showError('items-error', itemsCtx.search.error);
+  return all;
 }
+
+$('items-filter').oninput = () => {
+  if (!itemsCtx) return;
+  itemsCursor = 0;
+  clearTimeout(itemsTimer);
+  const q = $('items-filter').value.trim();
+  itemsCtx.search = q ? 'loading' : null;
+  showError('items-error', null);
+  renderItems();
+  if (!q) return;
+  // After a pause, ask the forge too: finds items beyond the first page, and any #number.
+  const seq = ++itemsSeq;
+  const { project, data } = itemsCtx;
+  itemsTimer = setTimeout(async () => {
+    let result;
+    try {
+      const qs = new URLSearchParams({ project: project.path, remote: data.remote, q });
+      if (itemsCtx.filter) qs.set('filter', itemsCtx.filter);
+      const r = await api('GET', `/api/forge/items?${qs}`);
+      result = r.error ? { error: r.error } : { issues: r.issues, prs: r.prs };
+    } catch (err) {
+      result = { error: err.message };
+    }
+    if (seq !== itemsSeq) return;
+    itemsCtx.search = result;
+    renderItems();
+  }, 400);
+};
+
+$('items-filter').onkeydown = (e) => {
+  if (!itemsCtx || !['ArrowDown', 'ArrowUp', 'Enter'].includes(e.key)) return;
+  e.preventDefault();
+  const all = renderItems();
+  if (e.key === 'Enter') {
+    if (all[itemsCursor]) startItem(all[itemsCursor]);
+    return;
+  }
+  itemsCursor = Math.max(0, Math.min(all.length - 1, itemsCursor + (e.key === 'ArrowDown' ? 1 : -1)));
+  renderItems();
+  document.querySelector('#dlg-items .rows.pick li.selected')?.scrollIntoView({ block: 'nearest' });
+};

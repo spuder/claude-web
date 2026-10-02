@@ -153,3 +153,19 @@ select {
 .rows.pick li.selected { box-shadow: inset 2px 0 0 var(--accent); }
 .rows .empty-row { color: var(--muted); background: none; cursor: default; }
 .num { color: var(--muted); font-variant-numeric: tabular-nums; }
+.rows.pick li.section-row { background: none; cursor: default; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 8px 8px 2px; }
+#clone-integration { flex: 0 1 35%; min-width: 0; }
+
+/* Fork remotes */
+.segmented { display: flex; gap: 0; margin: 4px 0 8px; }
+.segmented button { border-radius: 0; font-size: 12px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.segmented button:first-child { border-radius: 6px 0 0 6px; }
+.segmented button:last-child { border-radius: 0 6px 6px 0; border-left: none; }
+.segmented button.on { border-color: var(--accent); color: var(--accent); }
+.banner { display: flex; gap: 10px; align-items: center; padding: 8px 10px; margin: 4px 0 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+#clone-upstream-row { align-items: flex-start; }
+
+/* Issue filter chips */
+.chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0 8px; }
+.chips button { font-size: 12px; padding: 3px 10px; border-radius: 999px; color: var(--muted); }
+.chips button.on { border-color: var(--accent); color: var(--accent); }

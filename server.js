@@ -68,7 +68,7 @@ function listProjects() {
         path: full,
         git: fs.existsSync(path.join(full, '.git')),
         claudeMd: fs.existsSync(path.join(full, 'CLAUDE.md')),
-        forge: forge && { type: forge.integration.type, repo: forge.repo },
+        forge: forge && { type: forge.integration.type, repo: forge.repo, upstream: forge.upstream?.repo || null },
       };
     })
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -102,7 +102,16 @@ async function createProject({ name, git }) {
   return { name: path.basename(full), path: full };
 }
 
-async function cloneProject({ integration: id, repo, name }) {
+const forgeAuthEnv = (forge) => ({ ...process.env, ...forges.gitAuthEnv([forge?.origin?.integration, forge?.upstream?.integration]) });
+
+async function addUpstream(dir, i, parent) {
+  const env = { ...process.env, ...forges.gitAuthEnv(i) };
+  await run('git', ['remote', 'add', 'upstream', forges.cloneUrl(i, parent)], { cwd: dir });
+  await run('git', ['fetch', '--quiet', 'upstream'], { cwd: dir, env, timeout: 10 * 60 * 1000 });
+  console.log(`[upstream] ${dir} <- ${parent}`);
+}
+
+async function cloneProject({ integration: id, repo, name, upstream }) {
   const i = forges.getIntegration(id);
   if (!i) throw new HttpError(404, 'Integration not found.');
   repo = String(repo || '').trim().replace(/^\/+|\/+$|\.git$/g, '');
@@ -119,7 +128,41 @@ async function cloneProject({ integration: id, repo, name }) {
     fs.rmSync(full, { recursive: true, force: true });
     throw new HttpError(502, `git clone failed: ${(err.stderr || err.message).trim().slice(0, 300)}`);
   }
-  return { name: path.basename(full), path: full };
+
+  // For forks, wire up the parent as `upstream` so issues/PRs come from there.
+  let upstreamRepo = null;
+  let warning = null;
+  if (upstream) {
+    try {
+      const { parent } = await forges.getRepoInfo(i, repo);
+      if (parent) {
+        await addUpstream(full, i, parent);
+        upstreamRepo = parent;
+      }
+    } catch (err) {
+      warning = `Cloned, but adding the upstream remote failed: ${(err.stderr || err.message).trim().slice(0, 200)}`;
+    }
+  }
+  return { name: path.basename(full), path: full, upstream: upstreamRepo, warning };
+}
+
+// Add the fork parent of an existing project's origin as `upstream`.
+async function addUpstreamToProject({ project }) {
+  const dir = resolveProject(project);
+  if (!dir) throw new HttpError(400, 'Invalid project directory.');
+  const forge = forges.findForge(dir, 'origin');
+  if (!forge) throw new HttpError(404, "This project's origin remote doesn't match a connected integration.");
+  if (forge.upstream || fs.readFileSync(path.join(dir, '.git', 'config'), 'utf8').includes('[remote "upstream"]')) {
+    throw new HttpError(409, 'This project already has an upstream remote.');
+  }
+  const { parent } = await forges.getRepoInfo(forge.integration, forge.repo);
+  if (!parent) throw new HttpError(400, `${forge.repo} isn't a fork.`);
+  try {
+    await addUpstream(dir, forge.integration, parent);
+  } catch (err) {
+    throw new HttpError(502, `Adding upstream failed: ${(err.stderr || err.message).trim().slice(0, 300)}`);
+  }
+  return { upstream: parent };
 }
 
 // ---------- issue / PR agents ----------
@@ -127,33 +170,43 @@ async function cloneProject({ integration: id, repo, name }) {
 // Each issue/PR agent gets its own worktree so parallel agents don't fight
 // over one checkout. Re-opening the same item reuses its worktree.
 async function prepareWorktree(project, forge, kind, number) {
-  const slug = `${kind}-${number}`;
+  // Items from origin on a fork with upstream get a prefix so they can't collide with upstream's numbers.
+  const slug = `${forge.remote === 'origin' && forge.upstream ? 'origin-' : ''}${kind}-${number}`;
   const wt = path.join(WORKTREES_ROOT, path.basename(project), slug);
   if (fs.existsSync(wt)) return { dir: wt, branch: slug };
 
   fs.mkdirSync(path.dirname(wt), { recursive: true });
-  const git = (args) =>
-    run('git', args, { cwd: project, env: { ...process.env, ...forges.gitAuthEnv(forge.integration) } });
+  const env = forgeAuthEnv(forge);
+  const git = (args) => run('git', args, { cwd: project, env, timeout: 10 * 60 * 1000 });
+
   if (kind === 'pr') {
-    // Force-update the local pr-N branch to the PR's current head.
-    await git(['fetch', 'origin', `+${forges.prRef(forge.integration, number)}:refs/heads/${slug}`]);
+    // PR refs live on the repo the PR targets. Force-update the local branch to its current head.
+    await git(['fetch', forge.remote, `+${forges.prRef(forge.integration, number)}:refs/heads/${slug}`]);
     await git(['worktree', 'add', wt, slug]);
     return { dir: wt, branch: slug };
   }
+
   const branchExists = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${slug}`]).then(
     () => true,
     () => false
   );
-
   if (branchExists) {
     await git(['worktree', 'add', wt, slug]);
-  } else {
-    await git(['worktree', 'add', '-b', slug, wt, 'HEAD']);
+    return { dir: wt, branch: slug };
   }
-  return { dir: wt, branch: slug };
+
+  // On a fork, start fixes from upstream's latest default branch, not whatever is checked out locally.
+  let base = 'HEAD';
+  if (forge.remote === 'upstream') {
+    const { defaultBranch } = await forges.getRepoInfo(forge.integration, forge.repo);
+    await git(['fetch', '--quiet', 'upstream', defaultBranch]);
+    base = `upstream/${defaultBranch}`;
+  }
+  await git(['worktree', 'add', '--no-track', '-b', slug, wt, base]);
+  return { dir: wt, branch: slug, base };
 }
 
-async function taskPrompt(forge, kind, number, branch) {
+async function taskPrompt(forge, kind, number, { branch, base }) {
   const i = forge.integration;
   const item = await forges.getItem(i, forge.repo, kind, number);
   const noun = kind === 'pr' ? (i.type === 'gitlab' ? 'merge request' : 'pull request') : 'issue';
@@ -172,10 +225,16 @@ async function taskPrompt(forge, kind, number, branch) {
       ? `You're in a dedicated git worktree with this ${noun} checked out on branch ${branch}. ` +
         `Review the changes against the base branch for bugs, risks and missing tests, and report your findings. ` +
         `Don't push or comment on the ${noun} unless I ask.`
-      : `You're in a dedicated git worktree on a new branch, ${branch}. Investigate the codebase and implement ` +
-        `a fix for this issue. When you're done, summarize what you changed. Don't push or open a ` +
-        `pull request unless I ask.`;
-  return intro + ask;
+      : `You're in a dedicated git worktree on a new branch, ${branch}${base && base !== 'HEAD' ? ` (started from ${base})` : ''}. ` +
+        `Investigate the codebase and implement a fix for this issue. When you're done, summarize what you ` +
+        `changed. Don't push or open a pull request unless I ask.`;
+
+  const remotes =
+    forge.origin && forge.upstream
+      ? `\n\nGit remotes: origin is my fork (${forge.origin.repo}); upstream is ${forge.upstream.repo}. ` +
+        `If I ask you to push, push to origin and open the ${kind === 'pr' ? noun : 'pull request'} against upstream.`
+      : '';
+  return intro + ask + remotes;
 }
 
 // ---------- HTTP ----------
@@ -213,6 +272,14 @@ const routes = {
   'GET /api/projects': () => ({ root: PROJECTS_ROOT, projects: listProjects() }),
   'POST /api/projects': (q, body) => createProject(body),
   'POST /api/clone': (q, body) => cloneProject(body),
+  'POST /api/upstream': (q, body) => addUpstreamToProject(body),
+  'GET /api/repo-info': (q) => {
+    const i = forges.getIntegration(q.get('integration'));
+    if (!i) throw new HttpError(404, 'Integration not found.');
+    const repo = (q.get('repo') || '').trim();
+    if (!REPO_RE.test(repo)) throw new HttpError(400, 'Repo must look like owner/name.');
+    return forges.getRepoInfo(i, repo);
+  },
 
   'GET /api/settings': () => ({
     settingsFile: forges.SETTINGS_FILE,
@@ -227,16 +294,46 @@ const routes = {
   'GET /api/repos': (q) => {
     const i = forges.getIntegration(q.get('integration'));
     if (!i) throw new HttpError(404, 'Integration not found.');
-    return forges.listRepos(i);
+    const search = (q.get('q') || '').trim();
+    return search ? forges.searchRepos(i, search.slice(0, 200)) : forges.listRepos(i);
   },
   'GET /api/forge/items': async (q) => {
     const dir = resolveProject(q.get('project'));
-    const forge = dir && forges.findForge(dir);
-    if (!forge) throw new HttpError(404, "This project's origin remote doesn't match a connected integration.");
+    const forge = dir && forges.findForge(dir, q.get('remote'));
+    if (!forge) throw new HttpError(404, "This project's remotes don't match a connected integration.");
+
+    // A fork cloned without upstream: point the user at the parent, where the issues usually are.
+    let suggestUpstream = null;
+    if (!forge.upstream && forge.origin && !q.get('q')) {
+      suggestUpstream = await forges.getRepoInfo(forge.origin.integration, forge.origin.repo).then(
+        (info) => info.parent,
+        () => null
+      );
+    }
+    let items = { issues: [], prs: [] };
+    let error = null;
+    const search = (q.get('q') || '').trim().slice(0, 200);
+    const filter = q.get('filter') || null;
+    if (filter && !forges.FILTERS.includes(filter)) throw new HttpError(400, 'Unknown filter.');
+    try {
+      items = search
+        ? await forges.searchItems(forge.integration, forge.repo, search, filter)
+        : await forges.listIssuesAndPrs(forge.integration, forge.repo, filter);
+    } catch (err) {
+      error = err.message;
+    }
     return {
       repo: forge.repo,
+      remote: forge.remote,
       type: forge.integration.type,
-      ...(await forges.listIssuesAndPrs(forge.integration, forge.repo)),
+      me: forge.integration.username,
+      filter,
+      filters: forges.FILTERS.filter((f) => forges.supportsFilter(forge.integration, f)),
+      origin: forge.origin?.repo || null,
+      upstream: forge.upstream?.repo || null,
+      suggestUpstream,
+      error,
+      ...items,
     };
   },
 };
@@ -308,21 +405,22 @@ wss.on('connection', async (ws, url) => {
 
   let cwd = project;
   const args = [];
-  let extraEnv = {};
-  const forge = forges.findForge(project);
-  if (forge) extraEnv = forges.gitAuthEnv(forge.integration);
+  const remote = q.get('remote');
+  if (remote && !['origin', 'upstream'].includes(remote)) return fail('Invalid remote.');
+  const forge = forges.findForge(project, remote);
+  const extraEnv = forge ? forges.gitAuthEnv([forge.origin?.integration, forge.upstream?.integration]) : {};
 
   const kind = q.get('kind');
   const number = Number(q.get('number'));
   if (kind) {
     if (!['issue', 'pr'].includes(kind) || !Number.isInteger(number) || number < 1) return fail('Invalid issue/PR.');
-    if (!forge) return fail("This project's origin remote doesn't match a connected integration.");
+    if (!forge) return fail("This project's remotes don't match a connected integration.");
     try {
       say(`\x1b[2mPreparing worktree for ${kind} #${number}…\x1b[0m\r\n`);
       const wt = await prepareWorktree(project, forge, kind, number);
       cwd = wt.dir;
       if (q.get('resume') === '1') args.push('--continue');
-      else args.push(await taskPrompt(forge, kind, number, wt.branch));
+      else args.push(await taskPrompt(forge, kind, number, wt));
     } catch (err) {
       return fail(`Couldn't set up ${kind} #${number}: ${(err.stderr || err.message).trim()}`);
     }
